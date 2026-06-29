@@ -1,34 +1,27 @@
 name: Deploy to GitHub Pages
 
 on:
-  # Runs every time you push to the main branch
+  # Runs every time you push to master (or main)
   push:
     branches:
+      - master
       - main
-      - master        # include both common default branch names
 
-  # Allows you to manually trigger from the GitHub Actions tab
+  # Allows manual trigger from the Actions tab
   workflow_dispatch:
 
-# Sets permissions so the workflow can write to GitHub Pages
 permissions:
-  contents: read
-  pages: write
-  id-token: write
-
-# Only one deployment runs at a time
-concurrency:
-  group: "pages"
-  cancel-in-progress: false
+  contents: write   # needed to push to gh-pages branch
 
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repository
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -37,28 +30,20 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build Next.js static export
+      - name: Build static export
         run: npm run build
         env:
-          # This flag tells next.config.ts to apply the /arc-reactor-3d basePath
+          # Tells next.config.ts to apply /arc-reactor-3d basePath
           NEXT_PUBLIC_GITHUB_PAGES: "1"
 
-      - name: Add .nojekyll file
-        # Prevents GitHub Pages from processing files starting with underscore (_next/)
+      - name: Add .nojekyll
+        # Prevents GitHub Pages Jekyll from ignoring _next/ assets
         run: touch out/.nojekyll
 
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+      - name: Deploy to gh-pages branch
+        uses: peaceiris/actions-gh-pages@v4
         with:
-          path: ./out
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./out
+          publish_branch: gh-pages    # creates/updates this branch automatically
+          force_orphan: true          # keeps gh-pages branch clean (no history bloat)
