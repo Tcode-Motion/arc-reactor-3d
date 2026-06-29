@@ -26,31 +26,178 @@ export default function ArcRiactor() {
   const currentFrame = useTransform(scrollYProgress, [0, 0.80], [0, FRAME_COUNT - 1]);
   const smoothFrame  = useSpring(currentFrame, { stiffness: 100, damping: 28, restDelta: 0.5 });
 
-  // ─── Preload ───────────────────────────────────────────────────────────────
-  useEffect(() => {
-    const loadedImages: HTMLImageElement[] = [];
-    let loaded = 0;
+  const [loadProgress, setLoadProgress] = useState(0);
 
-    for (let i = 1; i <= FRAME_COUNT; i++) {
-      const img = new Image();
-      img.src   = `${IMAGE_PATH}${i.toString().padStart(3, "0")}.jpg`;
-      img.onload = img.onerror = () => {
-        loadedImages[i - 1] = img;
-        if (++loaded === FRAME_COUNT) {
-          imagesRef.current = loadedImages;
-          setIsLoading(false);
-          drawFrame(0); // show first frame immediately
-        }
-      };
+  // ─── Cache Storage Helpers ────────────────────────────────────────────────
+  const CACHE_NAME = "arc-reactor-image-cache-v1";
+
+  const getCachedImage = async (url: string): Promise<string | null> => {
+    try {
+      if (typeof window === "undefined" || !("caches" in window)) return null;
+      const cache = await caches.open(CACHE_NAME);
+      const cachedResponse = await cache.match(url);
+      if (cachedResponse) {
+        const blob = await cachedResponse.blob();
+        return URL.createObjectURL(blob);
+      }
+    } catch (e) {
+      console.warn("Cache API read error:", e);
     }
+    return null;
+  };
+
+  const cacheImage = async (url: string, response: Response) => {
+    try {
+      if (typeof window === "undefined" || !("caches" in window)) return;
+      const cache = await caches.open(CACHE_NAME);
+      await cache.put(url, response);
+    } catch (e) {
+      console.warn("Cache API write error:", e);
+    }
+  };
+
+  const loadAndCacheImage = (
+    url: string,
+    index: number,
+    targetArray: HTMLImageElement[]
+  ): Promise<void> => {
+    return new Promise(async (resolve) => {
+      // 1. Try Cache Storage first
+      try {
+        const cachedUrl = await getCachedImage(url);
+        if (cachedUrl) {
+          const img = new Image();
+          img.src = cachedUrl;
+          img.onload = () => {
+            targetArray[index] = img;
+            resolve();
+          };
+          img.onerror = () => {
+            fallbackToNetwork(url, index, targetArray).then(resolve);
+          };
+          return;
+        }
+      } catch (err) {
+        // Fallback
+      }
+
+      // 2. Fetch & Cache
+      try {
+        const response = await fetch(url);
+        if (response.ok) {
+          const responseClone = response.clone();
+          const blob = await response.blob();
+          const objectUrl = URL.createObjectURL(blob);
+
+          const img = new Image();
+          img.src = objectUrl;
+          img.onload = () => {
+            targetArray[index] = img;
+            cacheImage(url, responseClone);
+            resolve();
+          };
+          img.onerror = () => {
+            fallbackToNetwork(url, index, targetArray).then(resolve);
+          };
+        } else {
+          fallbackToNetwork(url, index, targetArray).then(resolve);
+        }
+      } catch (e) {
+        fallbackToNetwork(url, index, targetArray).then(resolve);
+      }
+    });
+  };
+
+  const fallbackToNetwork = (
+    url: string,
+    index: number,
+    targetArray: HTMLImageElement[]
+  ): Promise<void> => {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.src = url;
+      img.onload = () => {
+        targetArray[index] = img;
+        resolve();
+      };
+      img.onerror = () => {
+        resolve();
+      };
+    });
+  };
+
+  // ─── Progressive Loader ──────────────────────────────────────────────────
+  useEffect(() => {
+    const loadImages = async () => {
+      const loadedImages: HTMLImageElement[] = [];
+
+      // 1. Load the first critical frames (0 to 14) so the page is ready to show
+      const criticalCount = 15;
+      const criticalPromises = [];
+      
+      for (let i = 0; i < criticalCount; i++) {
+        const url = `${IMAGE_PATH}${(i + 1).toString().padStart(3, "0")}.jpg`;
+        criticalPromises.push(
+          loadAndCacheImage(url, i, loadedImages).then(() => {
+            // Update progress for critical batch (0% to 100% of critical load)
+            const count = loadedImages.filter(Boolean).length;
+            setLoadProgress(Math.min(Math.round((count / criticalCount) * 100), 100));
+          })
+        );
+      }
+
+      await Promise.all(criticalPromises);
+      imagesRef.current = loadedImages;
+      setIsLoading(false); // Hide full loading screen immediately!
+      drawFrame(0);
+
+      // 2. Stream remaining frames in background in parallel batches of 8
+      const remainingFrames = [];
+      for (let i = criticalCount; i < FRAME_COUNT; i++) {
+        const url = `${IMAGE_PATH}${(i + 1).toString().padStart(3, "0")}.jpg`;
+        remainingFrames.push({ url, index: i });
+      }
+
+      const batchSize = 8;
+      for (let i = 0; i < remainingFrames.length; i += batchSize) {
+        const batch = remainingFrames.slice(i, i + batchSize);
+        await Promise.all(
+          batch.map((item) => loadAndCacheImage(item.url, item.index, loadedImages))
+        );
+        // Silently update images reference
+        imagesRef.current = [...loadedImages];
+      }
+    };
+
+    loadImages();
   }, []);
 
-  // ─── Draw — runs inside a RAF so it never blocks the main thread twice ────
+  // ─── Draw Frame with Smart Fallback ───────────────────────────────────────
   const drawFrame = (index: number) => {
     const canvas = canvasRef.current;
     const ctx    = canvas?.getContext("2d");
-    const img    = imagesRef.current[index];
-    if (!canvas || !ctx || !img) return;
+    if (!canvas || !ctx) return;
+
+    // Smart Fallback: Find nearest loaded frame if target frame isn't loaded yet
+    let img = imagesRef.current[index];
+    if (!img) {
+      let nearestIndex = -1;
+      let minDistance = Infinity;
+      for (let i = 0; i < FRAME_COUNT; i++) {
+        if (imagesRef.current[i]) {
+          const dist = Math.abs(i - index);
+          if (dist < minDistance) {
+            minDistance = dist;
+            nearestIndex = i;
+          }
+        }
+      }
+      if (nearestIndex !== -1) {
+        img = imagesRef.current[nearestIndex];
+      }
+    }
+
+    if (!img) return; // absolute fallback (if nothing is loaded yet)
 
     // Cover-fit
     const scale = Math.max(canvas.width / img.width, canvas.height / img.height);
@@ -60,12 +207,11 @@ export default function ArcRiactor() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(img, x, y, img.width * scale, img.height * scale);
 
-    // ── Baked vignette (replaces the CSS blend-mode layers — zero GPU cost) ──
+    // Baked vignette
     const cx   = canvas.width / 2;
     const cy   = canvas.height / 2;
     const rMax = Math.hypot(cx, cy) * 1.1;
 
-    // deep vignette
     const vig = ctx.createRadialGradient(cx, cy, rMax * 0.30, cx, cy, rMax);
     vig.addColorStop(0,    "rgba(0,0,0,0)");
     vig.addColorStop(0.55, "rgba(0,0,0,0.18)");
@@ -73,7 +219,7 @@ export default function ArcRiactor() {
     ctx.fillStyle = vig;
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    // cool blue tint at the center
+    // Cool blue tint center
     const tint = ctx.createRadialGradient(cx, cy, 0, cx, cy, rMax * 0.5);
     tint.addColorStop(0,   "rgba(0,190,255,0.05)");
     tint.addColorStop(0.6, "rgba(0,60,160,0.04)");
@@ -85,10 +231,10 @@ export default function ArcRiactor() {
   // ─── RAF-throttled scroll listener ────────────────────────────────────────
   useMotionValueEvent(smoothFrame, "change", (latest) => {
     const idx = Math.min(Math.max(Math.round(latest), 0), FRAME_COUNT - 1);
-    if (idx === lastIndex.current) return;   // same frame — skip entirely
+    if (idx === lastIndex.current) return;
     lastIndex.current = idx;
 
-    if (rafRef.current) return;              // RAF already queued — skip
+    if (rafRef.current) return;
     rafRef.current = requestAnimationFrame(() => {
       drawFrame(idx);
       rafRef.current = 0;
@@ -120,7 +266,9 @@ export default function ArcRiactor() {
       {isLoading && (
         <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-[#050505]">
           <div className="animate-spin rounded-full h-16 w-16 border-t-2 border-b-2 border-blue-400/80 mb-4" />
-          <p className="text-white/50 tracking-widest text-xs uppercase animate-pulse">Initializing Core...</p>
+          <p className="text-white/70 tracking-widest text-xs uppercase animate-pulse font-mono">
+            Initializing Core... {loadProgress}%
+          </p>
         </div>
       )}
 
