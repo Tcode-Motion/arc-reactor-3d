@@ -1,0 +1,64 @@
+name: Deploy to GitHub Pages
+
+on:
+  # Runs every time you push to the main branch
+  push:
+    branches:
+      - main
+      - master        # include both common default branch names
+
+  # Allows you to manually trigger from the GitHub Actions tab
+  workflow_dispatch:
+
+# Sets permissions so the workflow can write to GitHub Pages
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one deployment runs at a time
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Next.js static export
+        run: npm run build
+        env:
+          # This flag tells next.config.ts to apply the /arc-reactor-3d basePath
+          NEXT_PUBLIC_GITHUB_PAGES: "1"
+
+      - name: Add .nojekyll file
+        # Prevents GitHub Pages from processing files starting with underscore (_next/)
+        run: touch out/.nojekyll
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
